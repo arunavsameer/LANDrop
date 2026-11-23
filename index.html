@@ -580,6 +580,60 @@
       clip: rect(0, 0, 0, 0);
       white-space: nowrap;
     }
+
+    /* QR Code Modal */
+    .qr-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.72);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 110;
+      padding: 16px;
+    }
+
+    .qr-modal-backdrop.active {
+      display: flex;
+    }
+
+    .qr-modal-card {
+      background: var(--panel);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      padding: 18px 20px;
+      width: 100%;
+      max-width: 340px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+    }
+
+    .qr-svg-box {
+      width: 210px;
+      height: 210px;
+      background: #fff;
+      border-radius: 6px;
+      padding: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .qr-svg-box svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .qr-iface-tabs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
   </style>
 </head>
 <body>
@@ -604,11 +658,33 @@
         <span class="mono" style="margin-left:4px;">Ctrl+V to paste clipboard</span>
       </div>
       <div class="identity-bar">
+        <button id="qrToggleBtn" type="button" title="Show LAN QR Code">
+          <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM14 19h2v2h-2zM19 14h2v2h-2z"/></svg>
+          QR Code
+        </button>
         <span class="mono">Handle:</span>
         <input type="text" id="nameInput" maxlength="28" placeholder="node-name" aria-label="Your device handle" />
         <button id="saveNameBtn" type="button">Update</button>
       </div>
     </header>
+
+    <!-- QR Code Modal (hidden by default) -->
+    <div id="qrModal" class="qr-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="qrModalTitle">
+      <div class="qr-modal-card">
+        <div style="width:100%; display:flex; justify-content:space-between; align-items:center;">
+          <strong id="qrModalTitle" style="font-family:var(--mono); font-size:0.86rem;">SCAN TO JOIN LAN</strong>
+          <button id="qrCloseBtn" type="button" style="padding:3px 8px; font-size:0.75rem;">Close</button>
+        </div>
+        <div id="qrIfaceTabs" class="qr-iface-tabs" style="display:none;"></div>
+        <div id="qrSvgContainer" class="qr-svg-box">
+          <span class="mono">Loading...</span>
+        </div>
+        <div style="width:100%; display:flex; align-items:center; gap:6px;">
+          <input id="qrUrlInput" type="text" readonly style="flex:1; font-size:0.78rem; text-align:center;" aria-label="LAN URL" />
+          <button id="qrCopyBtn" type="button">Copy</button>
+        </div>
+      </div>
+    </div>
 
     <!-- Network / Reconnect Banner -->
     <div id="netBanner" class="net-banner" role="status">
@@ -702,8 +778,11 @@
 
 <script>
 // ============================================================================
-// 1. FAST CRC-32 & ZERO-COPY ZIP STREAM BUILDER
+// 1. FAST CRC-32, BACKGROUND PRE-INDEXING & ZERO-COPY ZIP STREAM BUILDER
 // ============================================================================
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder();
+
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
@@ -732,19 +811,43 @@ async function computeFileCrc32(file) {
   return crc >>> 0;
 }
 
+// Background CRC-32 pre-indexing queue so ZIP assembly is instant on send
+let crcQueueChain = Promise.resolve();
+function queueEntryCrc(entry) {
+  if (entry.crc32 !== undefined || entry.crcPromise) return;
+  entry.crcPromise = (crcQueueChain = crcQueueChain.then(async () => {
+    if (!stagedEntries.includes(entry)) return 0;
+    const crc = await computeFileCrc32(entry.file);
+    entry.crc32 = crc;
+    return crc;
+  }).catch(() => undefined));
+}
+
+function toDosDateTime(timestampMs) {
+  const d = new Date(timestampMs || Date.now());
+  const year = Math.max(1980, d.getFullYear());
+  const dosDate = ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  return { dosTime, dosDate };
+}
+
 async function buildZipBlobFromEntries(entries, onStatus) {
-  const enc = new TextEncoder();
   const blobParts = [];
   const centralDir = [];
   let offset = 0;
 
   for (let idx = 0; idx < entries.length; idx++) {
     const item = entries[idx];
-    if (onStatus) onStatus(`Indexing CRC32 (${idx + 1}/${entries.length}): ${item.relPath}`);
-    const nameBytes = enc.encode(item.relPath.replace(/^\/+/, ''));
-    const crc = item.crc32 !== undefined ? item.crc32 : await computeFileCrc32(item.file);
-    item.crc32 = crc;
+    const nameBytes = TEXT_ENCODER.encode(item.relPath.replace(/^\/+/, ''));
+    let crc = item.crc32;
+    if (crc === undefined) {
+      if (onStatus) onStatus(`Indexing CRC32 (${idx + 1}/${entries.length}): ${item.relPath}`);
+      crc = item.crcPromise ? await item.crcPromise : undefined;
+      if (crc === undefined) crc = await computeFileCrc32(item.file);
+      item.crc32 = crc;
+    }
     const size = item.file.size;
+    const { dosTime, dosDate } = toDosDateTime(item.file.lastModified);
 
     const lfh = new Uint8Array(30 + nameBytes.length);
     const lv = new DataView(lfh.buffer);
@@ -752,8 +855,8 @@ async function buildZipBlobFromEntries(entries, onStatus) {
     lv.setUint16(4, 20, true);
     lv.setUint16(6, 0x0800, true);
     lv.setUint16(8, 0, true);
-    lv.setUint16(10, 0, true);
-    lv.setUint16(12, 0x21, true);
+    lv.setUint16(10, dosTime, true);
+    lv.setUint16(12, dosDate, true);
     lv.setUint32(14, crc, true);
     lv.setUint32(18, size, true);
     lv.setUint32(22, size, true);
@@ -768,8 +871,8 @@ async function buildZipBlobFromEntries(entries, onStatus) {
     cv.setUint16(6, 20, true);
     cv.setUint16(8, 0x0800, true);
     cv.setUint16(10, 0, true);
-    cv.setUint16(12, 0, true);
-    cv.setUint16(14, 0x21, true);
+    cv.setUint16(12, dosTime, true);
+    cv.setUint16(14, dosDate, true);
     cv.setUint32(16, crc, true);
     cv.setUint32(20, size, true);
     cv.setUint32(24, size, true);
@@ -828,10 +931,33 @@ function fmtEta(seconds) {
 }
 
 function uuid4() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const hex = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0;
     return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
   });
+}
+
+const activeBlobUrls = new Set();
+function registerBlobUrl(url) {
+  activeBlobUrls.add(url);
+  return url;
+}
+function revokeAllBlobUrls() {
+  for (const url of activeBlobUrls) {
+    try { URL.revokeObjectURL(url); } catch {}
+  }
+  activeBlobUrls.clear();
 }
 
 function escapeHtml(str) {
@@ -882,13 +1008,17 @@ const nameInput = document.getElementById('nameInput');
 nameInput.value = myName;
 
 let ws = null;
-let stagedEntries = []; // { id, file, relPath, isFromFolder }
+let stagedEntries = []; // { id, file, relPath, isFromFolder, crc32, crcPromise }
 let peers = [];
 let pendingIncoming = null;
 let directTargetPeerId = null;
 let activeNotePeerId = null;
 
 const CHUNK_SIZE = 16 * 1024 - 64; // 16,320 bytes (+ 36B header = 16,356B, safe on iOS/Android)
+const MACRO_SLICE_SIZE = 2 * 1024 * 1024; // 2 MB macro-reads (130x fewer Blob.slice calls)
+const COMPACT_THRESHOLD = 16 * 1024 * 1024; // Compact received chunks into a Blob every 16 MB
+const UI_THROTTLE_MS = 60; // Cap progress DOM updates to ~16 FPS
+
 const activeReceives = new Map();
 const activeSends = new Map();
 const rtcPeers = new Map();
@@ -896,7 +1026,18 @@ const rtcPeers = new Map();
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let countdownInterval = null;
-let heartbeatInterval = null;
+
+function cleanupRtcPeer(reqId) {
+  const ctx = rtcPeers.get(reqId);
+  if (!ctx) return;
+  rtcPeers.delete(reqId);
+  if (ctx.dc) {
+    try { ctx.dc.onopen = null; ctx.dc.onmessage = null; ctx.dc.close(); } catch {}
+  }
+  if (ctx.pc) {
+    try { ctx.pc.onicecandidate = null; ctx.pc.ondatachannel = null; ctx.pc.close(); } catch {}
+  }
+}
 
 function hasActiveTransfers() {
   return activeReceives.size > 0 || activeSends.size > 0;
@@ -912,7 +1053,8 @@ window.addEventListener('beforeunload', (e) => {
 
 function detectDevice() {
   const ua = navigator.userAgent;
-  if (/Android|iPhone|iPad/i.test(ua)) return 'Mobile';
+  if (/Android|iPhone|iPad|iPod/i.test(ua)) return 'Mobile';
+  if (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) return 'Mobile';
   if (/Linux/i.test(ua)) return 'Linux';
   if (/Mac/i.test(ua)) return 'macOS';
   if (/Win/i.test(ua)) return 'Windows';
@@ -1002,6 +1144,21 @@ function deduplicatePeers(rawList) {
   return Array.from(bySignature.values());
 }
 
+function peersEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (
+      a[i].id !== b[i].id ||
+      a[i].name !== b[i].name ||
+      a[i].device !== b[i].device ||
+      a[i].ip !== b[i].ip
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function handlePeerDepartures(newPeerList) {
   const newIds = new Set(newPeerList.map(p => p.id));
 
@@ -1009,6 +1166,7 @@ function handlePeerDepartures(newPeerList) {
     if (st.fromId && !newIds.has(st.fromId)) {
       const peerName = st.peerName || 'Peer';
       activeReceives.delete(transferId);
+      cleanupRtcPeer(transferId);
       removeInlineTelemetry(st.fromId);
       updateTransferStatus(transferId, `${peerName} disconnected. Transfer incomplete.`, 'err');
       showToast(`${peerName} disconnected. Transfer incomplete.`, 'err');
@@ -1019,6 +1177,7 @@ function handlePeerDepartures(newPeerList) {
     if (!newIds.has(st.peerId)) {
       st.aborted = true;
       activeSends.delete(transferId);
+      cleanupRtcPeer(transferId);
       removeInlineTelemetry(st.peerId);
       updateTransferStatus(transferId, `${st.peerName} disconnected. Transfer incomplete.`, 'err');
       showToast(`${st.peerName} disconnected. Transfer incomplete.`, 'err');
@@ -1035,14 +1194,19 @@ function handlePeerDepartures(newPeerList) {
 function abortAllActiveTransfers(reason) {
   for (const [transferId, st] of activeReceives.entries()) {
     activeReceives.delete(transferId);
+    cleanupRtcPeer(transferId);
     removeInlineTelemetry(st.fromId);
     updateTransferStatus(transferId, `Aborted: ${reason}`, 'err');
   }
   for (const [transferId, st] of activeSends.entries()) {
     st.aborted = true;
     activeSends.delete(transferId);
+    cleanupRtcPeer(transferId);
     removeInlineTelemetry(st.peerId);
     updateTransferStatus(transferId, `Aborted: ${reason}`, 'err');
+  }
+  for (const reqId of Array.from(rtcPeers.keys())) {
+    cleanupRtcPeer(reqId);
   }
 }
 
@@ -1066,17 +1230,9 @@ function connectSignaling() {
     clearInterval(countdownInterval);
     updateNetworkBanner();
     ws.send(JSON.stringify({ type: 'REGISTER', id: myId, name: myName, device: detectDevice() }));
-
-    clearInterval(heartbeatInterval);
-    heartbeatInterval = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'REGISTER', id: myId, name: myName, device: detectDevice() }));
-      }
-    }, 20000);
   };
 
   ws.onclose = () => {
-    clearInterval(heartbeatInterval);
     abortAllActiveTransfers('Signaling connection closed');
     scheduleReconnect(false);
   };
@@ -1100,8 +1256,10 @@ function connectSignaling() {
     if (msg.type === 'PEERS') {
       const nextPeers = deduplicatePeers(msg.peers || []);
       handlePeerDepartures(nextPeers);
-      peers = nextPeers;
-      renderPeers();
+      if (!peersEqual(peers, nextPeers)) {
+        peers = nextPeers;
+        renderPeers();
+      }
     } else if (msg.type === 'TRANSFER_REQ') {
       if (msg.isTextNote && typeof msg.textContent === 'string') {
         handleIncomingTextNote(msg);
@@ -1119,6 +1277,8 @@ function connectSignaling() {
     } else if (msg.type === 'TRANSFER_ACCEPT') {
       startSendingToPeer(msg.from, msg.reqId);
     } else if (msg.type === 'TRANSFER_DECLINE') {
+      activeSends.delete(msg.reqId);
+      cleanupRtcPeer(msg.reqId);
       removeInlineTelemetry(msg.from);
       updateTransferStatus(msg.reqId, 'Declined by receiver', 'err');
       showToast('Transfer declined by peer.', 'err');
@@ -1131,6 +1291,7 @@ function connectSignaling() {
     } else if (msg.type === 'FILE_EOF') {
       finalizeReceive(msg.transferId, msg.from, msg.expectedCrc);
     } else if (msg.type === 'VERIFY_ACK') {
+      cleanupRtcPeer(msg.transferId);
       removeInlineTelemetry(msg.from);
       updateTransferStatus(msg.transferId, `Delivered & Verified (CRC32: ${msg.crcHex})`, 'ok');
     }
@@ -1184,6 +1345,7 @@ document.getElementById('clearStagedBtn').onclick = () => {
 };
 
 document.getElementById('clearHistoryBtn').onclick = () => {
+  revokeAllBlobUrls();
   const list = document.getElementById('transferList');
   list.innerHTML = '<div class="mono">No transfers initiated yet.</div>';
 };
@@ -1198,12 +1360,14 @@ function validateAndStageFiles(rawFiles, isFolder = false, targetPeerId = null) 
       continue;
     }
     const rel = isFolder ? (f.webkitRelativePath || f.name) : f.name;
-    stagedEntries.push({
+    const entry = {
       id: uuid4(),
       file: f,
       relPath: rel,
       isFromFolder: isFolder
-    });
+    };
+    stagedEntries.push(entry);
+    queueEntryCrc(entry);
     added++;
   }
 
@@ -1253,12 +1417,14 @@ async function traverseFileTree(entry, pathPrefix = '') {
     if (file.size === 0) {
       return { skippedZero: 1, added: 0 };
     }
-    stagedEntries.push({
+    const staged = {
       id: uuid4(),
       file,
       relPath: pathPrefix ? `${pathPrefix}/${file.name}` : file.name,
       isFromFolder: Boolean(pathPrefix)
-    });
+    };
+    stagedEntries.push(staged);
+    queueEntryCrc(staged);
     return { skippedZero: 0, added: 1 };
   } else if (entry.isDirectory) {
     const dirReader = entry.createReader();
@@ -1480,6 +1646,16 @@ function renderPeers() {
     return;
   }
 
+  let preservedNoteValue = '';
+  let preservedNoteFocused = false;
+  if (activeNotePeerId) {
+    const existingInput = container.querySelector(`.peer-note-input[data-peer-id="${activeNotePeerId}"]`);
+    if (existingInput) {
+      preservedNoteValue = existingInput.value;
+      preservedNoteFocused = document.activeElement === existingInput;
+    }
+  }
+
   const hasStaged = stagedEntries.length > 0;
   container.innerHTML = '';
 
@@ -1582,6 +1758,10 @@ function renderPeers() {
     };
 
     container.appendChild(row);
+    if (isNoteOpen && noteInput) {
+      if (preservedNoteValue) noteInput.value = preservedNoteValue;
+      if (preservedNoteFocused) noteInput.focus();
+    }
   }
 }
 
@@ -1759,9 +1939,7 @@ function cancelTransfer(transferId) {
   const sendCtx = activeSends.get(transferId);
   if (sendCtx) {
     sendCtx.aborted = true;
-    if (sendCtx.dc) {
-      try { sendCtx.dc.close(); } catch {}
-    }
+    cleanupRtcPeer(transferId);
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: 'TRANSFER_CANCEL',
@@ -1778,6 +1956,7 @@ function cancelTransfer(transferId) {
 
   const recvCtx = activeReceives.get(transferId);
   if (recvCtx) {
+    cleanupRtcPeer(transferId);
     if (ws && ws.readyState === WebSocket.OPEN && recvCtx.fromId) {
       ws.send(JSON.stringify({
         type: 'TRANSFER_CANCEL',
@@ -1801,6 +1980,7 @@ function handleRemoteCancel(transferId, fromId) {
   if (activeReceives.has(transferId)) {
     activeReceives.delete(transferId);
   }
+  cleanupRtcPeer(transferId);
   removeInlineTelemetry(fromId);
   updateTransferStatus(transferId, 'Canceled by peer', 'err');
   showToast('Peer canceled the transfer.', 'err');
@@ -1815,7 +1995,7 @@ async function startSendingToPeer(targetId, reqId) {
   const dc = pc.createDataChannel('landrop', { ordered: true });
   dc.binaryType = 'arraybuffer';
   sendCtx.dc = dc;
-  rtcPeers.set(reqId, { pc, dc, targetId });
+  rtcPeers.set(reqId, { pc, dc, targetId, pendingCandidates: [] });
 
   let started = false;
   const fallbackTimer = setTimeout(() => {
@@ -1857,10 +2037,11 @@ async function handleWebRTCSignal(fromId, reqId, signal) {
   let ctx = rtcPeers.get(reqId);
   if (!ctx) {
     const pc = new RTCPeerConnection({ iceServers: [] });
-    ctx = { pc, dc: null, targetId: fromId };
+    ctx = { pc, dc: null, targetId: fromId, pendingCandidates: [] };
     rtcPeers.set(reqId, ctx);
     pc.ondatachannel = (ev) => {
       const ch = ev.channel;
+      ctx.dc = ch;
       ch.binaryType = 'arraybuffer';
       ch.onmessage = async (e) => {
         if (typeof e.data === 'string') {
@@ -1891,6 +2072,10 @@ async function handleWebRTCSignal(fromId, reqId, signal) {
   const { pc } = ctx;
   if (signal.sdp) {
     await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+    while (ctx.pendingCandidates.length > 0) {
+      const cand = ctx.pendingCandidates.shift();
+      try { await pc.addIceCandidate(new RTCIceCandidate(cand)); } catch {}
+    }
     if (signal.sdp.type === 'offer') {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -1902,7 +2087,11 @@ async function handleWebRTCSignal(fromId, reqId, signal) {
       }));
     }
   } else if (signal.candidate) {
-    try { await pc.addIceCandidate(new RTCIceCandidate(signal.candidate)); } catch {}
+    if (pc.remoteDescription && pc.remoteDescription.type) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(signal.candidate)); } catch {}
+    } else {
+      ctx.pendingCandidates.push(signal.candidate);
+    }
   }
 }
 
@@ -1969,6 +2158,7 @@ async function streamPayload(targetId, reqId, dc) {
   if (useDc) {
     if (dc.readyState !== 'open') {
       activeSends.delete(transferId);
+      cleanupRtcPeer(transferId);
       updateTransferStatus(transferId, 'WebRTC channel closed before start', 'err');
       return;
     }
@@ -1977,68 +2167,77 @@ async function streamPayload(targetId, reqId, dc) {
     ws.send(JSON.stringify(headerMsg));
   }
 
-  const targetPrefix = new TextEncoder().encode(targetId);
-  const idBytes = new TextEncoder().encode(transferId);
+  const targetPrefix = TEXT_ENCODER.encode(targetId);
+  const idBytes = TEXT_ENCODER.encode(transferId);
+  const headerLen = useDc ? 36 : 72;
+  const frameBuf = new Uint8Array(headerLen + CHUNK_SIZE);
+  if (useDc) {
+    frameBuf.set(idBytes, 0);
+  } else {
+    frameBuf.set(targetPrefix, 0);
+    frameBuf.set(idBytes, 36);
+  }
+
+  const telemetryLabel = info.count > 1 ? `Sending ${info.count} files (${info.payloadName})` : info.payloadName;
   let offset = 0;
   let rollingCrc = 0;
   const startTime = performance.now();
+  let lastUiUpdate = 0;
 
   while (offset < payloadBlob.size) {
     if (sendCtx.aborted) return;
 
-    const ok = useDc
-      ? await waitForBufferDrain(dc, 1 * 1024 * 1024, sendCtx)
-      : await waitForBufferDrain(ws, 4 * 1024 * 1024, sendCtx);
-
-    if (!ok) {
-      activeSends.delete(transferId);
-      removeInlineTelemetry(targetId);
-      updateTransferStatus(transferId, `${mode} connection dropped mid-transfer`, 'err');
-      showToast('Connection dropped during transfer.', 'err');
-      return;
-    }
-
-    const slice = await payloadBlob.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
+    const macroEnd = Math.min(payloadBlob.size, offset + MACRO_SLICE_SIZE);
+    const macroBuf = await payloadBlob.slice(offset, macroEnd).arrayBuffer();
     if (sendCtx.aborted) return;
+    const macroBytes = new Uint8Array(macroBuf);
 
-    const chunkBytes = new Uint8Array(slice);
-    rollingCrc = crc32Update(rollingCrc, chunkBytes);
+    for (let subOffset = 0; subOffset < macroBytes.byteLength; subOffset += CHUNK_SIZE) {
+      if (sendCtx.aborted) return;
 
-    if (useDc) {
-      if (dc.readyState !== 'open') {
+      const ok = useDc
+        ? await waitForBufferDrain(dc, 1 * 1024 * 1024, sendCtx)
+        : await waitForBufferDrain(ws, 4 * 1024 * 1024, sendCtx);
+
+      if (!ok) {
         activeSends.delete(transferId);
+        cleanupRtcPeer(transferId);
         removeInlineTelemetry(targetId);
-        updateTransferStatus(transferId, 'WebRTC channel closed mid-transfer', 'err');
+        updateTransferStatus(transferId, `${mode} connection dropped mid-transfer`, 'err');
+        showToast('Connection dropped during transfer.', 'err');
         return;
       }
-      const frame = new Uint8Array(36 + chunkBytes.length);
-      frame.set(idBytes, 0);
-      frame.set(chunkBytes, 36);
-      dc.send(frame.buffer);
-    } else {
-      const frame = new Uint8Array(36 + 36 + chunkBytes.length);
-      frame.set(targetPrefix, 0);
-      frame.set(idBytes, 36);
-      frame.set(chunkBytes, 72);
-      ws.send(frame.buffer);
+
+      const chunkBytes = macroBytes.subarray(subOffset, Math.min(macroBytes.byteLength, subOffset + CHUNK_SIZE));
+      rollingCrc = crc32Update(rollingCrc, chunkBytes);
+      frameBuf.set(chunkBytes, headerLen);
+      const packet = frameBuf.subarray(0, headerLen + chunkBytes.byteLength);
+
+      if (useDc) {
+        if (dc.readyState !== 'open') {
+          activeSends.delete(transferId);
+          cleanupRtcPeer(transferId);
+          removeInlineTelemetry(targetId);
+          updateTransferStatus(transferId, 'WebRTC channel closed mid-transfer', 'err');
+          return;
+        }
+        dc.send(packet);
+      } else {
+        ws.send(packet);
+      }
+
+      offset += chunkBytes.byteLength;
+      const now = performance.now();
+      if (now - lastUiUpdate >= UI_THROTTLE_MS || offset >= payloadBlob.size) {
+        lastUiUpdate = now;
+        const elapsedSec = Math.max(0.05, (now - startTime) / 1000);
+        const speedBps = offset / elapsedSec;
+        const etaSec = (payloadBlob.size - offset) / Math.max(1, speedBps);
+
+        updateTransferProgress(transferId, offset, payloadBlob.size, speedBps, etaSec);
+        renderInlineTelemetry(targetId, transferId, telemetryLabel, offset, payloadBlob.size, speedBps, etaSec);
+      }
     }
-
-    offset += chunkBytes.length;
-
-    const elapsedSec = Math.max(0.05, (performance.now() - startTime) / 1000);
-    const speedBps = offset / elapsedSec;
-    const etaSec = (payloadBlob.size - offset) / Math.max(1, speedBps);
-
-    updateTransferProgress(transferId, offset, payloadBlob.size, speedBps, etaSec);
-    renderInlineTelemetry(
-      targetId,
-      transferId,
-      info.count > 1 ? `Sending ${info.count} files (${info.payloadName})` : info.payloadName,
-      offset,
-      payloadBlob.size,
-      speedBps,
-      etaSec
-    );
   }
 
   // Wait for the send buffer to fully flush before signaling EOF
@@ -2048,6 +2247,7 @@ async function streamPayload(targetId, reqId, dc) {
 
   activeSends.delete(transferId);
   if (!flushed) {
+    cleanupRtcPeer(transferId);
     removeInlineTelemetry(targetId);
     updateTransferStatus(transferId, 'Connection dropped before EOF', 'err');
     return;
@@ -2078,16 +2278,18 @@ function initReceiveState(hdr) {
     fromId: hdr.from,
     peerName,
     received: 0,
+    uncompactedBytes: 0,
     crc: 0,
     chunks: [],
-    startTime: performance.now()
+    startTime: performance.now(),
+    lastUiUpdate: 0
   });
 }
 
 function handleBinaryChunk(buffer) {
   const bytes = new Uint8Array(buffer);
   if (bytes.byteLength < 36) return;
-  const transferId = new TextDecoder().decode(bytes.subarray(0, 36));
+  const transferId = TEXT_DECODER.decode(bytes.subarray(0, 36));
   const payload = bytes.subarray(36);
   const st = activeReceives.get(transferId);
   if (!st) return;
@@ -2095,14 +2297,24 @@ function handleBinaryChunk(buffer) {
   st.chunks.push(payload);
   st.crc = crc32Update(st.crc, payload);
   st.received += payload.byteLength;
+  st.uncompactedBytes += payload.byteLength;
 
-  const elapsedSec = Math.max(0.05, (performance.now() - st.startTime) / 1000);
-  const speedBps = st.received / elapsedSec;
-  const etaSec = (st.size - st.received) / Math.max(1, speedBps);
+  if (st.uncompactedBytes >= COMPACT_THRESHOLD) {
+    st.chunks = [new Blob(st.chunks)];
+    st.uncompactedBytes = 0;
+  }
 
-  updateTransferProgress(transferId, st.received, st.size, speedBps, etaSec);
-  if (st.fromId) {
-    renderInlineTelemetry(st.fromId, transferId, st.name, st.received, st.size, speedBps, etaSec);
+  const now = performance.now();
+  if (now - st.lastUiUpdate >= UI_THROTTLE_MS || st.received >= st.size) {
+    st.lastUiUpdate = now;
+    const elapsedSec = Math.max(0.05, (now - st.startTime) / 1000);
+    const speedBps = st.received / elapsedSec;
+    const etaSec = (st.size - st.received) / Math.max(1, speedBps);
+
+    updateTransferProgress(transferId, st.received, st.size, speedBps, etaSec);
+    if (st.fromId) {
+      renderInlineTelemetry(st.fromId, transferId, st.name, st.received, st.size, speedBps, etaSec);
+    }
   }
 }
 
@@ -2110,6 +2322,7 @@ function finalizeReceive(transferId, senderId, expectedCrc) {
   const st = activeReceives.get(transferId);
   if (!st) return;
 
+  cleanupRtcPeer(transferId);
   removeInlineTelemetry(st.fromId || senderId);
 
   const sizeMatch = st.received === st.size;
@@ -2118,7 +2331,7 @@ function finalizeReceive(transferId, senderId, expectedCrc) {
   if (sizeMatch && crcMatch) {
     const safeName = deduplicateFilename(st.name);
     const blob = new Blob(st.chunks, { type: st.mime });
-    const url = URL.createObjectURL(blob);
+    const url = registerBlobUrl(URL.createObjectURL(blob));
 
     try {
       const a = document.createElement('a');
@@ -2159,28 +2372,37 @@ function finalizeReceive(transferId, senderId, expectedCrc) {
 function renderInlineTelemetry(peerId, transferId, filename, done, total, speedBps, etaSec, customLabel) {
   const slot = document.getElementById(`peer-telemetry-${peerId}`);
   if (!slot) return;
-  slot.style.display = 'flex';
-  slot.className = 'peer-telemetry';
 
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
   const speedText = speedBps > 0 ? `${fmtBytes(speedBps)}/s` : '';
   const statsText = customLabel || `${pct}% • ${speedText} • ETA ${fmtEta(etaSec)}`;
 
-  slot.innerHTML = `
-    <div class="telemetry-top">
-      <span class="telemetry-filename">${escapeHtml(filename)}</span>
-      <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
-        <span class="mono tabular">${escapeHtml(statsText)}</span>
-        <button type="button" class="danger" style="padding:1px 6px; font-size:0.72rem;" title="Cancel transfer">×</button>
+  if (slot.getAttribute('data-transfer-id') !== transferId || !slot.querySelector('.progress-bar')) {
+    slot.style.display = 'flex';
+    slot.className = 'peer-telemetry';
+    slot.setAttribute('data-transfer-id', transferId);
+    slot.innerHTML = `
+      <div class="telemetry-top">
+        <span class="telemetry-filename"></span>
+        <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+          <span class="mono tabular telemetry-stats"></span>
+          <button type="button" class="danger telemetry-cancel-btn" style="padding:1px 6px; font-size:0.72rem;" title="Cancel transfer">×</button>
+        </div>
       </div>
-    </div>
-    <div class="progress-wrap"><div class="progress-bar" style="width:${pct}%"></div></div>
-  `;
+      <div class="progress-wrap"><div class="progress-bar"></div></div>
+    `;
+    slot.querySelector('.telemetry-cancel-btn').onclick = (e) => {
+      e.stopPropagation();
+      cancelTransfer(transferId);
+    };
+  }
 
-  slot.querySelector('button').onclick = (e) => {
-    e.stopPropagation();
-    cancelTransfer(transferId);
-  };
+  const fnEl = slot.querySelector('.telemetry-filename');
+  const stEl = slot.querySelector('.telemetry-stats');
+  const barEl = slot.querySelector('.progress-bar');
+  if (fnEl && fnEl.textContent !== filename) fnEl.textContent = filename;
+  if (stEl) stEl.textContent = statsText;
+  if (barEl) barEl.style.width = `${pct}%`;
 }
 
 function removeInlineTelemetry(peerId) {
@@ -2188,6 +2410,7 @@ function removeInlineTelemetry(peerId) {
   const slot = document.getElementById(`peer-telemetry-${peerId}`);
   if (slot) {
     slot.style.display = 'none';
+    slot.removeAttribute('data-transfer-id');
     slot.innerHTML = '';
   }
 }
@@ -2254,6 +2477,84 @@ function updateTransferStatus(id, text, cls, downloadLink = null) {
 }
 
 connectSignaling();
+
+// QR Code Modal Logic
+const qrModal = document.getElementById('qrModal');
+const qrToggleBtn = document.getElementById('qrToggleBtn');
+const qrCloseBtn = document.getElementById('qrCloseBtn');
+const qrSvgContainer = document.getElementById('qrSvgContainer');
+const qrUrlInput = document.getElementById('qrUrlInput');
+const qrCopyBtn = document.getElementById('qrCopyBtn');
+const qrIfaceTabs = document.getElementById('qrIfaceTabs');
+let qrItemsCache = null;
+
+function selectQrItem(index) {
+  if (!qrItemsCache || !qrItemsCache[index]) return;
+  const item = qrItemsCache[index];
+  qrSvgContainer.innerHTML = item.svg;
+  qrUrlInput.value = item.url;
+  Array.from(qrIfaceTabs.children).forEach((btn, idx) => {
+    btn.className = idx === index ? 'primary' : '';
+  });
+}
+
+async function openQrModal() {
+  qrModal.classList.add('active');
+  if (!qrItemsCache) {
+    try {
+      const res = await fetch('/api/qr');
+      const data = await res.json();
+      if (data && Array.isArray(data.items) && data.items.length) {
+        qrItemsCache = data.items;
+        if (qrItemsCache.length > 1) {
+          qrIfaceTabs.innerHTML = '';
+          qrItemsCache.forEach((item, idx) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.style.padding = '3px 8px';
+            btn.style.fontSize = '0.72rem';
+            btn.textContent = item.iface;
+            btn.onclick = () => selectQrItem(idx);
+            qrIfaceTabs.appendChild(btn);
+          });
+          qrIfaceTabs.style.display = 'flex';
+        }
+        selectQrItem(0);
+      }
+    } catch (e) {
+      qrSvgContainer.innerHTML = '<span class="mono">Failed to load QR</span>';
+    }
+  }
+}
+
+function closeQrModal() {
+  qrModal.classList.remove('active');
+}
+
+qrToggleBtn.onclick = () => {
+  if (qrModal.classList.contains('active')) closeQrModal();
+  else openQrModal();
+};
+qrCloseBtn.onclick = closeQrModal;
+qrModal.onclick = (e) => {
+  if (e.target === qrModal) closeQrModal();
+};
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && qrModal.classList.contains('active')) {
+    closeQrModal();
+  }
+});
+qrCopyBtn.onclick = async () => {
+  if (!qrUrlInput.value) return;
+  try {
+    await navigator.clipboard.writeText(qrUrlInput.value);
+    showToast('LAN URL copied to clipboard');
+  } catch {
+    qrUrlInput.select();
+    document.execCommand('copy');
+    showToast('LAN URL copied to clipboard');
+  }
+};
 </script>
 </body>
 </html>
